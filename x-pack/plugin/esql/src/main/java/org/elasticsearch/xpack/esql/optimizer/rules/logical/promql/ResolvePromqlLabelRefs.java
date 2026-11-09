@@ -14,7 +14,9 @@ import org.elasticsearch.xpack.esql.common.Failure;
 import org.elasticsearch.xpack.esql.core.expression.Alias;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
+import org.elasticsearch.xpack.esql.core.expression.Expressions;
 import org.elasticsearch.xpack.esql.core.expression.Literal;
+import org.elasticsearch.xpack.esql.core.expression.MetadataAttribute;
 import org.elasticsearch.xpack.esql.core.expression.NameId;
 import org.elasticsearch.xpack.esql.core.expression.NamedExpression;
 import org.elasticsearch.xpack.esql.core.expression.Nullability;
@@ -22,6 +24,7 @@ import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
 import org.elasticsearch.xpack.esql.core.expression.UnresolvedAttribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
+import org.elasticsearch.xpack.esql.core.util.CollectionUtils;
 import org.elasticsearch.xpack.esql.core.util.Holder;
 import org.elasticsearch.xpack.esql.expression.function.aggregate.AggregateFunction;
 import org.elasticsearch.xpack.esql.expression.function.aggregate.TimeSeriesAggregateFunction;
@@ -30,6 +33,7 @@ import org.elasticsearch.xpack.esql.expression.function.grouping.TimeSeriesWitho
 import org.elasticsearch.xpack.esql.expression.function.scalar.timeseries.TimeSeriesPath;
 import org.elasticsearch.xpack.esql.expression.function.scalar.timeseries.TimeSeriesTransform;
 import org.elasticsearch.xpack.esql.expression.function.scalar.timeseries.ToTimeSeries;
+import org.elasticsearch.xpack.esql.optimizer.rules.logical.TemporaryNameGenerator;
 import org.elasticsearch.xpack.esql.plan.logical.Aggregate;
 import org.elasticsearch.xpack.esql.plan.logical.EsRelation;
 import org.elasticsearch.xpack.esql.plan.logical.Eval;
@@ -490,6 +494,10 @@ public final class ResolvePromqlLabelRefs extends ParameterizedRule<LogicalPlan,
          * not: a non-dimension field is a label of the series that its label container does not hold, so carrying it beside the
          * label container keys by it too, as Prometheus keys by every label a WITHOUT leaves in. One the source lacks is dropped
          * from the keys. The source reads its label container without the labels it leaves out.
+         * <p>
+         * One row per series keys by the series ({@code _tsid}) too: two series can render the same labels, an empty label
+         * being absent, and their samples must not merge. A view leaving labels out groups series on purpose (a match key,
+         * say), so it keeps them grouped. The key stays out of the collapse's output.
          */
         private LogicalPlan resolveCollapse(TimeSeriesAggregate node, List<UnresolvedPromqlLabelRef> needs) {
             Alias value = (Alias) node.aggregates().getFirst();
@@ -518,11 +526,44 @@ public final class ResolvePromqlLabelRefs extends ParameterizedRule<LogicalPlan,
             var groupings = new ArrayList<Expression>();
             groupings.add(node.groupings().getFirst());
             groupings.addAll(groupKeys);
+            boolean bySeries = grain.perSeries();
+            Alias seriesKey = null;
+            if (bySeries) {
+                Attribute tsid = seriesId(child);
+                if (tsid == null) {
+                    Attribute added = new MetadataAttribute(source, MetadataAttribute.TSID_FIELD, DataType.TSID_DATA_TYPE, false);
+                    child = child.transformUp(
+                        EsRelation.class,
+                        relation -> relation.withAttributes(CollectionUtils.combine(relation.output(), added))
+                    );
+                    tsid = added;
+                }
+                seriesKey = new Alias(source, TemporaryNameGenerator.locallyUniqueTemporaryName(MetadataAttribute.TSID_FIELD), tsid);
+                groupings.add(seriesKey);
+            }
             List<NamedExpression> aggregates = placeKeys(node.aggregates(), groupKeys.stream().map(NamedExpression::toAttribute).toList());
-            if (keys.declared()) {
+            if (keys.declared() || bySeries) {
                 aggregates = wrapValues(aggregates);
             }
-            return node.with(child, groupings, aggregates);
+            List<Attribute> output = Expressions.asAttributes(aggregates);
+            if (seriesKey != null) {
+                // Aggregates end with every grouping, as the verifier and the time-series translation read them.
+                aggregates = CollectionUtils.combine(aggregates, seriesKey.toAttribute());
+            }
+            var collapse = node.with(child, groupings, aggregates);
+            return bySeries ? new Project(source, collapse, output) : collapse;
+        }
+
+        /** The {@code _tsid} the source relation of {@code plan} already reads, or null: a relation reads it at most once. */
+        private static @Nullable Attribute seriesId(LogicalPlan plan) {
+            for (EsRelation relation : plan.collect(EsRelation.class)) {
+                for (Attribute attribute : relation.output()) {
+                    if (attribute instanceof MetadataAttribute && MetadataAttribute.TSID_FIELD.equals(attribute.name())) {
+                        return attribute;
+                    }
+                }
+            }
+            return null;
         }
 
         /** A emitAggregate without packed dimensions: it keys by named labels only. */
