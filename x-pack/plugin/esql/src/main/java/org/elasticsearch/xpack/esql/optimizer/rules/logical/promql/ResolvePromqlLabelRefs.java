@@ -58,7 +58,6 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.function.Predicate;
 
 /**
  * Binds the label references ({@link UnresolvedPromqlLabelRef}) of a translated PromQL plan to columns, right after
@@ -70,9 +69,8 @@ import java.util.function.Predicate;
  * directions. Bottom-up, it traces each label container reference to the removals from the source and names it after them, e.g.
  * {@code _timeseries$dst$pod}. Top-down, it passes the labels each consumer needs toward its input, and binds every
  * reference on the way back: to the column its input carries, to a key carried up from the source, to the label container computed
- * from a finer view ({@link TimeSeriesTransform}) or read from it ({@link TimeSeriesPath}), or to null for a label no series
- * has. The source reads each view as keyword and casts it to a typed label container ({@link ToTimeSeries}); queries whose nodes
- * cannot read the typed form lower the result to keyword afterwards.
+ * from a finer view (typed {@link TimeSeriesTransform}) or read from it (typed {@link TimeSeriesPath}), or to null for a label
+ * no series has. Anything else, such as leaving labels out of a keyword label container, is not supported.
  */
 public final class ResolvePromqlLabelRefs extends ParameterizedRule<LogicalPlan, LogicalPlan, AnalyzerContext> {
 
@@ -100,6 +98,46 @@ public final class ResolvePromqlLabelRefs extends ParameterizedRule<LogicalPlan,
         return expression.children().stream().anyMatch(ResolvePromqlLabelRefs::hasAcrossSeriesAggregate);
     }
 
+    /** The declared grouping is a semantic dependency even when no parent reads its output. */
+    record Grain(@Nullable UnresolvedPromqlLabelRef labelContainer, List<UnresolvedPromqlLabelRef> labels, boolean perSeries) {}
+
+    /** A source needs at most one common label container view plus explicitly named columns. */
+    record Keys(@Nullable UnresolvedPromqlLabelRef labelContainer, List<UnresolvedPromqlLabelRef> labels) {
+        List<UnresolvedPromqlLabelRef> all() {
+            return labelContainer == null ? labels : Pass.concat(List.of(labelContainer), labels);
+        }
+    }
+
+    /**
+     * Pure transfer function for a grouping boundary. Initial per-series aggregation may carry any source field;
+     * other aggregates may carry only labels determined by their declared grain. The first label container demand replaces a
+     * grain nobody reads, so a single view is read as it is; further demands combine by intersection of exclusions.
+     */
+    static Keys selectKeys(Grain grain, List<UnresolvedPromqlLabelRef> needs, boolean initial) {
+        boolean perSeries = initial && grain.perSeries();
+        UnresolvedPromqlLabelRef labelContainer = grain.labelContainer();
+        boolean grainRead = labelContainer != null && needs.stream().anyMatch(labelContainer::reads);
+        var labels = new ArrayList<UnresolvedPromqlLabelRef>();
+        for (UnresolvedPromqlLabelRef need : needs) {
+            if (need.isLabelContainer()) {
+                if (perSeries && (labelContainer == null || labelContainer.reads(need) == false)) {
+                    if (labelContainer == null || (grainRead == false && labelContainer == grain.labelContainer())) {
+                        labelContainer = need;
+                    } else {
+                        var common = new LinkedHashSet<>(labelContainer.unset());
+                        common.retainAll(need.unset());
+                        labelContainer = labelContainer.againstSource(common);
+                    }
+                }
+            } else if (grain.labels().stream().noneMatch(need::reads)
+                && (perSeries || (grain.labelContainer() != null && grain.labelContainer().unset().contains(need.name()) == false))) {
+                    Pass.addIfAbsent(labels, need);
+                }
+        }
+        grain.labels().forEach(label -> Pass.addIfAbsent(labels, label));
+        return new Keys(labelContainer, List.copyOf(labels));
+    }
+
     /** One resolution over the plan. */
     private static final class Pass {
         /** Null when the pass only traces the label container. */
@@ -118,6 +156,7 @@ public final class ResolvePromqlLabelRefs extends ParameterizedRule<LogicalPlan,
             this.context = context;
         }
 
+        /** Every label container reference followed, by id: one reference read in several places follows once. */
         private final Map<NameId, UnresolvedPromqlLabelRef> followed = new HashMap<>();
 
         /** Followed plan plus the unset of its label container (composed toward the source). */
@@ -342,7 +381,8 @@ public final class ResolvePromqlLabelRefs extends ParameterizedRule<LogicalPlan,
 
         /** Rebuilds {@code node}, binding its own references, so that it carries every column of {@code needs} it can. */
         private LogicalPlan resolve(LogicalPlan node, List<UnresolvedPromqlLabelRef> needs) {
-            if (isRaw(node)) {
+            // A constant operand (vector(1)) reads its match key raw: what it lacks binds to null like anywhere else.
+            if (node.children().isEmpty()) {
                 return node;
             }
             if (node instanceof Project project && project.child() instanceof UnpackDims unpack) {
@@ -367,11 +407,6 @@ public final class ResolvePromqlLabelRefs extends ParameterizedRule<LogicalPlan,
                 return resolveUnary(unary, needs);
             }
             throw new IllegalStateException("unexpected node in a translated PromQL plan [" + node.nodeName() + "]");
-        }
-
-        /** A plan below every aggregation: the source with its filters. Every label there is a dimension or absent. */
-        private boolean isRaw(LogicalPlan node) {
-            return node.anyMatch(p -> p instanceof Aggregate || p instanceof HashJoin) == false;
         }
 
         /**
@@ -495,9 +530,9 @@ public final class ResolvePromqlLabelRefs extends ParameterizedRule<LogicalPlan,
          * label container keys by it too, as Prometheus keys by every label a WITHOUT leaves in. One the source lacks is dropped
          * from the keys. The source reads its label container without the labels it leaves out.
          * <p>
-         * One row per series keys by the series ({@code _tsid}) too: two series can render the same labels, an empty label
-         * being absent, and their samples must not merge. A view leaving labels out groups series on purpose (a match key,
-         * say), so it keeps them grouped. The key stays out of the collapse's output.
+         * One row per series of its full label container keys by the series ({@code _tsid}) too: two series can render the same
+         * labels, an empty label being absent, and their samples must not merge. A view leaving labels out groups series on
+         * purpose (a match key, say), so it keeps them grouped. The key stays out of the collapse's output.
          */
         private LogicalPlan resolveCollapse(TimeSeriesAggregate node, List<UnresolvedPromqlLabelRef> needs) {
             Alias value = (Alias) node.aggregates().getFirst();
@@ -508,14 +543,15 @@ public final class ResolvePromqlLabelRefs extends ParameterizedRule<LogicalPlan,
             Source source = node.source();
 
             var groupKeys = new ArrayList<NamedExpression>();
-            for (UnresolvedPromqlLabelRef key : keys.labelContainer()) {
-                List<Expression> fields = key.unset().stream().<Expression>map(label -> {
+            UnresolvedPromqlLabelRef labelContainer = keys.labelContainer();
+            if (labelContainer != null) {
+                List<Expression> fields = labelContainer.unset().stream().<Expression>map(label -> {
                     Attribute resolved = PromqlLabels.getLabel(raw.output(), label);
-                    // TimeSeriesWithout reads the names of the labels it leaves out, present at the source or not
+                    // The loader must see exclusions even when their labels are absent from this source.
                     return resolved != null ? resolved : new ReferenceAttribute(Source.EMPTY, label, DataType.KEYWORD);
                 }).toList();
                 // The series read their label container as a keyword view of the source, keyed by its typed form.
-                groupKeys.add(new Alias(source, key.name(), new ToTimeSeries(source, new TimeSeriesWithout(source, fields))));
+                groupKeys.add(new Alias(source, labelContainer.name(), new ToTimeSeries(source, new TimeSeriesWithout(source, fields))));
             }
             for (UnresolvedPromqlLabelRef label : keys.labels()) {
                 Attribute column = PromqlLabels.getField(raw, label.name());
@@ -526,6 +562,7 @@ public final class ResolvePromqlLabelRefs extends ParameterizedRule<LogicalPlan,
             var groupings = new ArrayList<Expression>();
             groupings.add(node.groupings().getFirst());
             groupings.addAll(groupKeys);
+            // A value that aggregates nothing across series keeps one row per series, whatever labels its readers need.
             boolean bySeries = grain.perSeries();
             Alias seriesKey = null;
             if (bySeries) {
@@ -542,7 +579,7 @@ public final class ResolvePromqlLabelRefs extends ParameterizedRule<LogicalPlan,
                 groupings.add(seriesKey);
             }
             List<NamedExpression> aggregates = placeKeys(node.aggregates(), groupKeys.stream().map(NamedExpression::toAttribute).toList());
-            if (keys.declared() || bySeries) {
+            if (keys.labelContainer() != null || keys.labels().isEmpty() == false || bySeries) {
                 aggregates = wrapValues(aggregates);
             }
             List<Attribute> output = Expressions.asAttributes(aggregates);
@@ -566,12 +603,12 @@ public final class ResolvePromqlLabelRefs extends ParameterizedRule<LogicalPlan,
             return null;
         }
 
-        /** A emitAggregate without packed dimensions: it keys by named labels only. */
+        /** An aggregate without packed dimensions: it keys by named labels only. */
         private LogicalPlan resolveAggregate(Aggregate node, List<UnresolvedPromqlLabelRef> needs) {
             Alias value = (Alias) node.aggregates().getFirst();
             Keys keys = keys(grain(node.groupings(), value), needs, false);
             List<UnresolvedPromqlLabelRef> own = references(node);
-            LogicalPlan child = resolve(node.child(), concat(keys.pushed(), own));
+            LogicalPlan child = resolve(node.child(), concat(keys.all(), own));
             Binding binding = bind(node, child, own, keys.all());
             List<Attribute> columns = keys.all().stream().map(binding::column).toList();
             var groupings = new ArrayList<Expression>();
@@ -583,7 +620,7 @@ public final class ResolvePromqlLabelRefs extends ParameterizedRule<LogicalPlan,
         }
 
         /**
-         * A emitAggregate over packed dimensions ({@link PackDims} under the {@link Aggregate}, {@link UnpackDims} and a projection
+         * An aggregate over packed dimensions ({@link PackDims} under the {@link Aggregate}, {@link UnpackDims} and a projection
          * above it): the keys are the dimensions it packs. A label it cannot get from its input is absent from every series
          * and packs as null.
          */
@@ -593,10 +630,10 @@ public final class ResolvePromqlLabelRefs extends ParameterizedRule<LogicalPlan,
             Alias value = (Alias) aggregate.aggregates().getFirst();
             Keys keys = keys(grain(pack.dims(), value), needs, false);
             List<UnresolvedPromqlLabelRef> own = concat(references(pack), references(aggregate));
-            LogicalPlan child = resolve(pack.child(), concat(keys.pushed(), own));
+            LogicalPlan child = resolve(pack.child(), concat(keys.all(), own));
             Binding binding = bind(pack, child, own, keys.all());
             List<Attribute> dims = keys.all().stream().map(binding::column).toList();
-            PackDims packed = new PackDims(pack.source(), binding.plan(), dims, pack.packed());
+            PackDims packed = new PackDims(pack.source(), binding.plan(), dims, pack.packed(), pack.emptyAsAbsent());
             Aggregate regrouped = (Aggregate) binding.apply(
                 new Aggregate(aggregate.source(), packed, aggregate.groupings(), wrapValues(aggregate.aggregates()))
             );
@@ -621,14 +658,7 @@ public final class ResolvePromqlLabelRefs extends ParameterizedRule<LogicalPlan,
 
         // -- keys --
 
-        /**
-         * What an aggregate keeps one row per: its label container, which determines every label it does not leave out, and its
-         * promoted keys, which determine only themselves. {@code perSeries} when its value aggregates nothing across series,
-         * so each group is one input row.
-         */
-        private record Grain(@Nullable UnresolvedPromqlLabelRef labelContainer, List<UnresolvedPromqlLabelRef> labels, boolean perSeries) {}
-
-        private Grain grain(List<? extends Expression> keyExpressions, Alias value) {
+        private static Grain grain(List<? extends Expression> keyExpressions, Alias value) {
             UnresolvedPromqlLabelRef labelContainer = null;
             var labels = new ArrayList<UnresolvedPromqlLabelRef>();
             for (Expression key : keyExpressions) {
@@ -643,79 +673,15 @@ public final class ResolvePromqlLabelRefs extends ParameterizedRule<LogicalPlan,
             return new Grain(labelContainer, labels, hasAcrossSeriesAggregate(value.child()) == false);
         }
 
-        /**
-         * The keys of an aggregate: its label container, then the labels pushed down through it, then its own labels.
-         *
-         * @param pushed what the aggregate needs of its input
-         * @param declared whether the aggregate keys by anything, present at the source or not
-         */
-        private record Keys(
-            List<UnresolvedPromqlLabelRef> labelContainer,
-            List<UnresolvedPromqlLabelRef> labels,
-            List<UnresolvedPromqlLabelRef> pushed,
-            boolean declared
-        ) {
-            List<UnresolvedPromqlLabelRef> all() {
-                return concat(labelContainer, labels);
-            }
-        }
-
-        /**
-         * A need rides along an aggregate when the aggregate's grain determines it. The initial aggregate of a series-preserving operator
-         * keeps one row per series, which determines every label and the whole label container; it reads one label container at most.
-         */
         private Keys keys(Grain grain, List<UnresolvedPromqlLabelRef> needs, boolean initial) {
-            boolean perSeries = initial && grain.perSeries();
-            var labelContainer = new ArrayList<UnresolvedPromqlLabelRef>();
-            if (grain.labelContainer() != null) {
-                labelContainer.add(grain.labelContainer());
+            Keys keys = selectKeys(grain, needs, initial);
+            if (keys.labelContainer() != null) {
+                unsetByName.putIfAbsent(keys.labelContainer().name(), keys.labelContainer().unset());
             }
-            // Whether anything above reads the aggregate's own label container; one row per series keys by it for nothing else.
-            boolean grainRead = grain.labelContainer() != null && needs.stream().anyMatch(grain.labelContainer()::reads);
-            var carried = new ArrayList<UnresolvedPromqlLabelRef>();
-            for (UnresolvedPromqlLabelRef need : needs) {
-                if (need.isLabelContainer()) {
-                    if (perSeries && labelContainer.stream().noneMatch(need::reads)) {
-                        if (labelContainer.isEmpty()) {
-                            labelContainer.add(need);
-                        } else if (grainRead == false
-                            && labelContainer.size() == 1
-                            && labelContainer.getFirst() == grain.labelContainer()) {
-                                // Nothing reads the aggregate's own view: the source reads the one needed instead.
-                                labelContainer.set(0, need);
-                            } else {
-                                // the source reads the finest label container needed; a reader of a coarser one leaves labels out of it
-                                int coarser = indexOf(labelContainer, read -> read.unset().containsAll(need.unset()));
-                                if (coarser >= 0) {
-                                    labelContainer.set(coarser, need);
-                                } else if (labelContainer.stream().noneMatch(read -> need.unset().containsAll(read.unset()))) {
-                                    // neither view derives from the other (a join key under ignoring(pod) and a group_left result
-                                    // leaving region out): the source reads what both leave out, and each reader derives its own
-                                    UnresolvedPromqlLabelRef read = labelContainer.getFirst();
-                                    var common = new LinkedHashSet<>(read.unset());
-                                    common.retainAll(need.unset());
-                                    UnresolvedPromqlLabelRef finest = read.againstSource(common);
-                                    unsetByName.putIfAbsent(finest.name(), finest.unset());
-                                    labelContainer.set(0, finest);
-                                }
-                            }
-                    }
-                } else if (grain.labels().stream().noneMatch(need::reads)
-                    && (perSeries || (grain.labelContainer() != null && grain.labelContainer().unset().contains(need.name()) == false))) {
-                        addIfAbsent(carried, need);
-                    }
-            }
-            var labels = new ArrayList<>(carried);
-            grain.labels().forEach(label -> addIfAbsent(labels, label));
-            return new Keys(
-                labelContainer,
-                labels,
-                concat(labelContainer, labels),
-                labelContainer.isEmpty() == false || labels.isEmpty() == false
-            );
+            return keys;
         }
 
-        private VerificationException unsupported(UnresolvedPromqlLabelRef ref) {
+        private static VerificationException unsupported(UnresolvedPromqlLabelRef ref) {
             return new VerificationException(
                 List.of(Failure.fail(ref, "leaving labels out of _timeseries requires a typed label container [{}]", ref.sourceText()))
             );
@@ -727,20 +693,15 @@ public final class ResolvePromqlLabelRefs extends ParameterizedRule<LogicalPlan,
         private record Binding(LogicalPlan plan, Map<String, Attribute> byName) {
             /**
              * Rewrites {@code node}'s references into references to their columns. An attribute the node took from its input
-             * while that input still read references is unresolved too; it now refers to the input's column with its id, or
-             * with its name when it lost the id ({@link Alias#toAttribute()} of an unresolved alias).
+             * while that input still read references is unresolved too; Alias.toAttribute preserves its id.
              */
             LogicalPlan apply(LogicalPlan node) {
                 var byId = new HashMap<NameId, Attribute>();
-                var byExactName = new HashMap<String, Attribute>();
-                plan.output().forEach(column -> {
-                    byId.put(column.id(), column);
-                    byExactName.put(column.name(), column);
-                });
+                plan.output().forEach(column -> byId.put(column.id(), column));
                 return node.transformExpressionsOnly(Attribute.class, attribute -> {
                     Attribute column = attribute instanceof UnresolvedPromqlLabelRef ref ? byName.get(ref.name())
                         : attribute.resolved() ? null
-                        : byId.getOrDefault(attribute.id(), byExactName.get(attribute.name()));
+                        : byId.get(attribute.id());
                     return column != null ? column : attribute;
                 });
             }
@@ -774,70 +735,48 @@ public final class ResolvePromqlLabelRefs extends ParameterizedRule<LogicalPlan,
                 if (byName.containsKey(ref.name())) {
                     continue;
                 }
-                Attribute column = column(child.output(), ref);
-                if (column == null && ref.isLabelContainer()) {
-                    // a typed label container the input carries a finer form of: leave the extra labels out with ts_transform
-                    Attribute input = finerLabelContainer(child.output(), ref.unset());
-                    if (input == null) {
-                        throw unsupported(ref);
-                    }
-                    var labels = new LinkedHashSet<>(ref.unset());
-                    labels.removeAll(unsetByName.get(input.name()));
-                    UnresolvedPromqlLabelRef read = ownByName.get(ref.name());
-                    Alias labelContainer = new Alias(
-                        ref.source(),
-                        ref.name(),
-                        unset(ref.source(), input, labels),
-                        read != null ? declared.getOrDefault(read.id(), read.id()) : new NameId()
-                    );
-                    nulls.add(labelContainer);
-                    column = labelContainer.toAttribute();
-                }
-                if (column == null && VectorBinaryOperator.EMPTY_SIGNATURE_KEY.equals(ref.name())) {
-                    // the signature slot of an operand without the label container: the empty label set, which an opaque sibling's
-                    // view equals once it has no label left outside the named key slots
+                Expression expression = value(child.output(), ref);
+                Attribute column;
+                if (expression instanceof Attribute attribute) {
+                    column = attribute;
+                } else {
                     UnresolvedPromqlLabelRef read = ownByName.get(ref.name());
                     NameId id = read != null ? declared.getOrDefault(read.id(), read.id()) : new NameId();
-                    Alias empty = new Alias(
-                        ref.source(),
-                        ref.name(),
-                        new ToTimeSeries(ref.source(), Literal.keyword(ref.source(), "{}")),
-                        id
-                    );
-                    nulls.add(empty);
-                    column = empty.toAttribute();
-                }
-                if (column == null && ref.isLabelContainer() == false) {
-                    // An opaque label container holds the label: materialize it with ts_path (label_replace/join, on(...), by(...)).
-                    // A label no source keeps as a dimension is in no label container: no series has it.
-                    Attribute labelContainer = dimensions.contains(PromqlLabels.labelName(ref.name()))
-                        ? labelContainerKeeping(child.output(), ref.name())
-                        : null;
-                    if (labelContainer != null) {
-                        UnresolvedPromqlLabelRef read = ownByName.get(ref.name());
-                        NameId id = read != null ? declared.getOrDefault(read.id(), read.id()) : new NameId();
-                        Alias extracted = new Alias(
-                            ref.source(),
-                            ref.name(),
-                            new TimeSeriesPath(ref.source(), labelContainer, Literal.keyword(ref.source(), ref.name())),
-                            id
-                        );
-                        nulls.add(extracted);
-                        column = extracted.toAttribute();
-                    }
-                }
-                if (column == null) {
-                    // under the id the node reads; a key pushed down from above gets its own, as each input defines it apart
-                    UnresolvedPromqlLabelRef read = ownByName.get(ref.name());
-                    NameId id = read != null ? declared.getOrDefault(read.id(), read.id()) : new NameId();
-                    Alias missing = new Alias(ref.source(), ref.name(), new Literal(ref.source(), null, DataType.KEYWORD), id);
-                    nulls.add(missing);
-                    column = missing.toAttribute();
+                    Alias alias = new Alias(ref.source(), ref.name(), expression, id);
+                    nulls.add(alias);
+                    column = alias.toAttribute();
                 }
                 byName.put(ref.name(), column);
             }
             LogicalPlan plan = nulls.isEmpty() ? child : new Eval(node.source(), child, nulls);
             return new Binding(plan, byName);
+        }
+
+        /** Selects the value independently of allocating aliases or rewriting the consumer. */
+        private Expression value(List<Attribute> output, UnresolvedPromqlLabelRef ref) {
+            Attribute column = column(output, ref);
+            if (column != null) {
+                return column;
+            }
+            if (ref.isLabelContainer()) {
+                Attribute input = finerLabelContainer(output, ref.unset());
+                if (input == null) {
+                    throw unsupported(ref);
+                }
+                var labels = new LinkedHashSet<>(ref.unset());
+                labels.removeAll(unsetByName.get(input.name()));
+                return unset(ref.source(), input, labels);
+            }
+            if (VectorBinaryOperator.EMPTY_SIGNATURE_KEY.equals(ref.name())) {
+                return new ToTimeSeries(ref.source(), Literal.keyword(ref.source(), "{}"));
+            }
+            // A label no source keeps as a dimension is in no label container: no series has it.
+            Attribute labelContainer = dimensions.contains(PromqlLabels.labelName(ref.name()))
+                ? labelContainerKeeping(output, ref.name())
+                : null;
+            return labelContainer != null
+                ? new TimeSeriesPath(ref.source(), labelContainer, Literal.keyword(ref.source(), ref.name()))
+                : new Literal(ref.source(), null, DataType.KEYWORD);
         }
 
         // -- helpers --
@@ -926,15 +865,6 @@ public final class ResolvePromqlLabelRefs extends ParameterizedRule<LogicalPlan,
                 }
             }
             return kept;
-        }
-
-        private static int indexOf(List<UnresolvedPromqlLabelRef> refs, Predicate<UnresolvedPromqlLabelRef> test) {
-            for (int i = 0; i < refs.size(); i++) {
-                if (test.test(refs.get(i))) {
-                    return i;
-                }
-            }
-            return -1;
         }
 
         /** Wraps every value that aggregates nothing across series in {@link Values}: each group is one input row. */
