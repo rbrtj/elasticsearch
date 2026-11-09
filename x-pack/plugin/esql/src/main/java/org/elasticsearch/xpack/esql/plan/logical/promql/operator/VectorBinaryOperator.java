@@ -798,7 +798,11 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
         // aggregates) resolve it by id, not just by name.
         Alias stepAlias = new Alias(step.source(), step.name(), step, context.stepAttr().id());
         Alias valueAlias = new Alias(source(), cmd.valueColumnName(), value, new NameId());
-        LogicalPlan plan = new Eval(cmd.source(), join, List.of(valueAlias, stepAlias));
+        // Right over the join: the value and step Evals shadow the operands' columns of the same name. Prometheus fails a
+        // group_left/group_right match before it compares values: copying the one side's labels over the many side's can
+        // leave two many side series with the same labels.
+        LogicalPlan matched = match.grouping() == Joining.NONE ? join : context.uniqueSeries(cmd.source(), join, step, output());
+        LogicalPlan plan = new Eval(cmd.source(), matched, List.of(valueAlias, stepAlias));
         if (filter != null) {
             plan = new Filter(source(), plan, filter);
         }
